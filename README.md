@@ -15,3 +15,9 @@ dlm [OPTIONS] -x n -s n -k -d <output-dir> <url>
   -h, --help               Print help  
   -V, --version            Print version
 ```
+
+### Build
+```
+git clone --depth 1 https://github.com/rhythmcache/dlm-rust && cd dlm-rust
+cargo build --release
+```
