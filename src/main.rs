@@ -16,10 +16,12 @@ struct DownloadState {
     downloaded_chunks: Vec<bool>,
     chunk_size: u64,
 }
+
 const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
 const MIN_CHUNK_SIZE: u64 = 16 * 1024;
 const DEFAULT_TIMEOUT: u64 = 300;
 const MAX_RETRIES: u64 = 3;
+
 struct DownloadManager {
     client: Client,
     num_connections: usize,
@@ -27,6 +29,7 @@ struct DownloadManager {
     download_dir: PathBuf,
     keep_partial: bool,
 }
+
 impl DownloadManager {
     fn new(num_connections: usize, chunk_size: u64, download_dir: PathBuf, keep_partial: bool) -> Self {
         DownloadManager {
@@ -40,6 +43,7 @@ impl DownloadManager {
             keep_partial,
         }
     }
+
     async fn download(&self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
         let url = Url::parse(url)?;
         let filename = url
@@ -47,9 +51,14 @@ impl DownloadManager {
             .and_then(|segments| segments.last())
             .unwrap_or("download")
             .to_string();
+
         let file_path = self.download_dir.join(&filename);
         let state_path = file_path.with_extension("dlstate");
+
+        // Create download directory if it doesn't exist
         fs::create_dir_all(&self.download_dir)?;
+
+        // Check if the server supports resumable downloads
         let resp = self.client.head(url.as_str()).send().await?;
         let supports_resume = resp
             .headers()
@@ -57,13 +66,18 @@ impl DownloadManager {
             .and_then(|value| value.to_str().ok())
             .map(|value| value == "bytes")
             .unwrap_or(false);
+
         if !supports_resume {
             eprintln!("Warning: The server does not support resumable downloads. Falling back to single connection.");
             return self.download_with_single_connection(url, &file_path).await;
         }
+
+        // Check if we can resume a previous download
         let download_state = if state_path.exists() && self.keep_partial {
             let state_content = fs::read_to_string(&state_path)?;
             let state: DownloadState = serde_json::from_str(&state_content)?;
+
+            // Verify URL matches
             if state.url != url.to_string() {
                 fs::remove_file(&state_path)?;
                 if file_path.exists() {
@@ -82,6 +96,8 @@ impl DownloadManager {
             }
             self.create_new_download_state(&url).await?
         };
+
+        // Create or open the output file
         let file = Arc::new(Mutex::new(
             OpenOptions::new()
                 .read(true)
@@ -89,6 +105,8 @@ impl DownloadManager {
                 .create(true)
                 .open(&file_path)?,
         ));
+
+        // Set up progress display
         let multi_progress = MultiProgress::new();
         let total_progress = multi_progress.add(ProgressBar::new(download_state.total_size));
         total_progress.set_style(
@@ -97,6 +115,8 @@ impl DownloadManager {
                 .unwrap()
                 .progress_chars("#>-"),
         );
+
+        // Set initial progress
         let initial_progress: u64 = download_state.downloaded_chunks
             .iter()
             .enumerate()
@@ -111,6 +131,7 @@ impl DownloadManager {
             })
             .sum();
         total_progress.inc(initial_progress);
+        
         let chunks: Vec<(usize, u64, u64)> = download_state.downloaded_chunks
             .iter()
             .enumerate()
@@ -124,20 +145,26 @@ impl DownloadManager {
                 (i, start, end)
             })
             .collect();
+
         if chunks.is_empty() {
             println!("Download already completed!");
             return Ok(());
         }
+        
         let semaphore = Arc::new(Semaphore::new(self.num_connections));
         let state = Arc::new(Mutex::new(download_state));
         let mut handles = vec![];
+        
         let (shutdown_tx, _) = broadcast::channel(1);
+        
         let shutdown_tx_clone = shutdown_tx.clone();
         tokio::spawn(async move {
             if let Ok(()) = tokio::signal::ctrl_c().await {
                 let _ = shutdown_tx_clone.send(());
             }
         });
+
+        // Download chunks
         for (chunk_index, start, end) in chunks {
             let url = url.clone();
             let client = self.client.clone();
@@ -166,6 +193,7 @@ impl DownloadManager {
                         .headers(headers)
                         .send()
                         .await;
+
                     match response {
                         Ok(mut resp) => {
                             let mut buf = Vec::with_capacity((end - start) as usize);
@@ -199,8 +227,12 @@ impl DownloadManager {
                                 writer.seek(SeekFrom::Start(start))?;
                                 writer.write_all(&buf)?;
                                 writer.flush()?;
+
+                                // Update download state
                                 let mut state = state.lock().await;
                                 state.downloaded_chunks[chunk_index] = true;
+
+                                // Save state to file
                                 let state_json = serde_json::to_string(&*state)?;
                                 fs::write(&state_path, state_json)?;
                             }
@@ -209,16 +241,20 @@ impl DownloadManager {
                             eprintln!("Chunk request failed: {}", e);
                         }
                     }
+
                     retries -= 1;
                 }
+
                 if !success {
                     return Err("Failed to download chunk after retries".into());
                 }
 
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             });
+
             handles.push(handle);
         }
+        
         for handle in handles {
             match handle.await {
                 Ok(Ok(())) => continue,
@@ -232,6 +268,7 @@ impl DownloadManager {
                 }
                 Err(e) => {
                     if !self.keep_partial {
+                        // Clean up partial download
                         let _ = fs::remove_file(&file_path);
                         let _ = fs::remove_file(&state_path);
                     }
@@ -239,11 +276,16 @@ impl DownloadManager {
                 }
             }
         }
+
+        // Clean up state file after successful download
         let _ = fs::remove_file(&state_path);
+
+        // Finish progress bar
         total_progress.finish_with_message("Download complete");
 
         Ok(())
     }
+
     async fn create_new_download_state(&self, url: &Url) -> Result<DownloadState, Box<dyn std::error::Error>> {
         let resp = self.client.head(url.as_str()).send().await?;
 
@@ -264,14 +306,19 @@ impl DownloadManager {
             chunk_size,
         })
     }
+
     async fn download_with_single_connection(&self, url: Url, file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         let mut response = self.client.get(url.as_str()).send().await?;
+
+        // Get the total file size from the response
         let total_size = response
             .headers()
             .get(reqwest::header::CONTENT_LENGTH)
             .and_then(|ct_len| ct_len.to_str().ok())
             .and_then(|ct_len| ct_len.parse::<u64>().ok())
             .unwrap_or(0);
+
+        // Create a progress bar
         let progress_bar = ProgressBar::new(total_size);
         progress_bar.set_style(
             ProgressStyle::default_bar()
@@ -279,13 +326,14 @@ impl DownloadManager {
                 .unwrap()
                 .progress_chars("#>-"),
         );
+
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .open(file_path)?;
 
         let mut downloaded: u64 = 0;
-        let mut buf: Vec<u8> = Vec::new();
+       // let mut buf: Vec<u8> = Vec::new();
 
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk)?;
@@ -298,6 +346,7 @@ impl DownloadManager {
         Ok(())
     }
 }
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = Command::new("dlm")
@@ -342,6 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .index(1),
         )
         .get_matches();
+
     let num_connections = matches
         .get_one::<String>("connections")
         .unwrap()
@@ -362,9 +412,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         download_dir,
         keep_partial,
     );
+
     if let Err(e) = downloader.download(url).await {
         eprintln!("Download failed: {}", e);
         std::process::exit(1);
     }
+
     Ok(())
 }
