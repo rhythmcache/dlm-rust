@@ -18,6 +18,5 @@ dlm [OPTIONS] -x n -s n -k -d <output-dir> <url>
 
 ### Build
 ```
-git clone --depth 1 https://github.com/rhythmcache/dlm-rust && cd dlm-rust
-cargo build --release
+git clone --depth 1 https://github.com/rhythmcache/dlm-rust && cd dlm-rust && cargo build --release
 ```
